@@ -29,12 +29,12 @@ Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
  apps/server/src/http.ts                       |  10 +
  .../src/orchestration-v2/AttachmentClaims.ts  |   3 +-
  apps/web/src/lib/attachmentUploadQueue.ts     |   6 +
- apps/web/src/lib/unboundChunkedUpload.ts      | 157 +++++++++++++++
+ apps/web/src/lib/unboundChunkedUpload.ts      | 155 +++++++++++++++
  .../client-runtime/src/state/attachments.ts   |   7 +-
  packages/contracts/src/assets.ts              |   4 +-
  packages/contracts/src/chatAttachment.ts      |  49 ++++-
  .../src/chatAttachment.unbound.test.ts        |  53 +++++
- 11 files changed, 462 insertions(+), 16 deletions(-)
+ 11 files changed, 460 insertions(+), 16 deletions(-)
  create mode 100644 apps/server/src/assets/UnboundUpload.ts
  create mode 100644 apps/web/src/lib/unboundChunkedUpload.ts
  create mode 100644 packages/contracts/src/chatAttachment.unbound.test.ts
@@ -352,10 +352,10 @@ index 6c9393e43b..8d02a5bbe6 100644
      xhr.open("POST", input.url, true);
 diff --git a/apps/web/src/lib/unboundChunkedUpload.ts b/apps/web/src/lib/unboundChunkedUpload.ts
 new file mode 100644
-index 0000000000..4daca92de0
+index 0000000000..5b2142ca8d
 --- /dev/null
 +++ b/apps/web/src/lib/unboundChunkedUpload.ts
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,155 @@
 +/**
 + * Unbound: sends a large attachment as resumable chunks.
 + *
@@ -386,8 +386,6 @@ index 0000000000..4daca92de0
 +  readonly body: string;
 +}
 +
-+class UploadCancelledError extends Error {}
-+
 +function sendChunk(input: {
 +  readonly url: string;
 +  readonly chunk: Blob;
@@ -406,7 +404,7 @@ index 0000000000..4daca92de0
 +      }, STALL_TIMEOUT_MS);
 +    };
 +    const onAbort = () => {
-+      reject(new UploadCancelledError(m(msg("Upload cancelled"))));
++      reject(new Error(m(msg("Upload cancelled"))));
 +      xhr.abort();
 +    };
 +    const settle = () => {
@@ -464,11 +462,11 @@ index 0000000000..4daca92de0
 +  let lastError: Error = new Error(m(msg("Upload failed")));
 +
 +  while (true) {
-+    if (input.signal.aborted) throw new UploadCancelledError(m(msg("Upload cancelled")));
++    if (input.signal.aborted) throw new Error(m(msg("Upload cancelled")));
 +    if (fruitlessAttempts >= MAX_FRUITLESS_ATTEMPTS) throw lastError;
 +    if (fruitlessAttempts > 0) {
 +      await wait(Math.min(MAX_RETRY_DELAY_MS, 500 * 2 ** fruitlessAttempts), input.signal);
-+      if (input.signal.aborted) throw new UploadCancelledError(m(msg("Upload cancelled")));
++      if (input.signal.aborted) throw new Error(m(msg("Upload cancelled")));
 +    }
 +
 +    const chunkStart = offset;
@@ -485,7 +483,7 @@ index 0000000000..4daca92de0
 +          input.onProgress(Math.min(1, (chunkStart + loadedBytes) / fileSize)),
 +      });
 +    } catch (error) {
-+      if (error instanceof UploadCancelledError) throw error;
++      if (input.signal.aborted) throw error;
 +      // A dropped connection may still have stored part of the chunk; the next attempt asks.
 +      lastError = error instanceof Error ? error : lastError;
 +      fruitlessAttempts += 1;
