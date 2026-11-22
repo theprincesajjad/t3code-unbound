@@ -1,0 +1,299 @@
+name: Release
+
+# Rebuilds each stable T3 Code release with the patches in `patches/` applied
+# and publishes the runtime archives `t3 update` installs.
+
+on:
+  schedule:
+    # Upstream cuts stable releases by hand; a few checks a day keeps this close behind.
+    - cron: "23 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream stable version to build (for example 0.1.11). Empty builds the newest."
+        required: false
+        type: string
+      force:
+        description: "Build even when this repository already has that release."
+        required: false
+        default: false
+        type: boolean
+      publish:
+        description: "Publish a GitHub release. Off keeps the archives as workflow artifacts only."
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPOSITORY: pingdotgg/t3code
+
+jobs:
+  resolve:
+    name: Resolve upstream release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - id: resolve
+        name: Resolve version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION#v}"
+          if [[ -z "$version" ]]; then
+            # GitHub's "latest" release is the newest stable; nightlies and previews are prereleases.
+            version="$(gh api "repos/$UPSTREAM_REPOSITORY/releases/latest" --jq .tag_name)"
+            version="${version#v}"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$version' is not a stable version."
+            exit 1
+          fi
+          build=true
+          if [[ "$INPUT_FORCE" != "true" ]] && gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            build=false
+            echo "v$version is already released here."
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.platform }} ${{ matrix.arch }}
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            platform: mac
+            arch: arm64
+            rust_target: aarch64-apple-darwin
+            resource_key: darwin-arm64
+          - runner: ubuntu-24.04
+            platform: linux
+            arch: x64
+            rust_target: x86_64-unknown-linux-gnu
+            resource_key: linux-x64
+          - runner: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+            rust_target: aarch64-unknown-linux-gnu
+            resource_key: linux-arm64
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Checkout patches
+        uses: actions/checkout@v4
+        with:
+          path: .unbound
+
+      # Upstream's tree sits at the workspace root so its own setup action and
+      # scripts run unchanged. `.repos` is vendored reference code no build reads.
+      - name: Checkout upstream
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "https://github.com/$UPSTREAM_REPOSITORY.git"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          base="$(tr -d '[:space:]' < .unbound/patches/BASE)"
+          # The patch base supplies the blobs a three-way apply needs once upstream moves on.
+          if [[ -n "$base" && "$base" != "$VERSION" ]]; then
+            git fetch -q --no-tags --depth=1 origin "refs/tags/v$base"
+          fi
+          git fetch -q --no-tags --depth=1 origin "refs/tags/v$VERSION"
+          git -c checkout.workers=0 checkout -q --detach FETCH_HEAD
+          echo ".unbound/" >> .git/info/exclude
+
+      - name: Apply patches
+        shell: bash
+        run: .unbound/scripts/apply-patches.sh
+
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=t3... --filter=@t3tools/web... --filter=@t3tools/scripts...
+
+      - name: Align package versions to release version
+        shell: bash
+        run: node scripts/update-release-package-versions.ts "$VERSION"
+
+      # The same public identifiers official builds bake in, so T3 Connect keeps working.
+      - name: Load public T3 Connect config
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in T3CODE_CLERK_PUBLISHABLE_KEY T3CODE_CLERK_JWT_TEMPLATE T3CODE_CLERK_CLI_OAUTH_CLIENT_ID T3CODE_RELAY_URL; do
+            value="$(sed -n "s|^$name=||p" .env.example | head -n 1)"
+            if [[ -z "$value" ]]; then
+              echo "::error::.env.example has no $name."
+              exit 1
+            fi
+            echo "$name=$value" >> "$GITHUB_ENV"
+          done
+          echo "T3CODE_TELEMETRY_CHANNEL=dev" >> "$GITHUB_ENV"
+          echo "T3CODE_DESKTOP_UPDATE_REPOSITORY=$GITHUB_REPOSITORY" >> "$GITHUB_ENV"
+
+      - name: Build server and web client
+        shell: bash
+        run: vp run --filter t3 build
+
+      - name: Apply web client branding
+        shell: bash
+        run: node scripts/apply-web-brand-assets.ts production apps/server/dist/client
+
+      - name: Build CLI single-executable
+        shell: bash
+        run: node apps/server/scripts/cli.ts build-exe --verbose
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Build resource monitor
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target "${{ matrix.rust_target }}"
+          target_dir="$RUNNER_TEMP/cli-resource-monitor/${{ matrix.resource_key }}"
+          mkdir -p "$target_dir"
+          cp "native/resource-monitor/target/${{ matrix.rust_target }}/release/t3-resource-monitor" "$target_dir/"
+
+      - name: Install patchelf
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: command -v patchelf || { sudo apt-get update && sudo apt-get install -y patchelf; }
+
+      - name: Build CLI archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/build-cli-archive.ts \
+            --platform "${{ matrix.platform }}" \
+            --arch "${{ matrix.arch }}" \
+            --version "$VERSION" \
+            --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" \
+            --output-dir release-cli
+
+      - name: Smoke-test CLI archive
+        shell: bash
+        run: node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "$VERSION"
+
+      - name: Upload CLI archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.platform }}-${{ matrix.arch }}
+          path: release-cli/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  publish:
+    name: Publish release
+    needs: [resolve, build]
+    # A Linux failure must not hold back the macOS archive this machine installs.
+    if: ${{ !cancelled() && needs.resolve.outputs.build == 'true' && (github.event_name == 'schedule' || inputs.publish) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout patches
+        uses: actions/checkout@v4
+
+      - name: Download CLI archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cli-*
+          path: release-cli
+          merge-multiple: true
+
+      - name: Publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-cli
+          if [[ ! -f "t3-$VERSION-darwin-arm64.tar.gz" ]]; then
+            echo "::error::The macOS arm64 archive is missing, so nothing is published."
+            exit 1
+          fi
+          sha256sum t3-* > SHA256SUMS
+          cat SHA256SUMS
+          notes="$(mktemp)"
+          {
+            echo "T3 Code $VERSION with the patches in [\`patches/\`](https://github.com/$GITHUB_REPOSITORY/tree/$GITHUB_SHA/patches) applied."
+            echo
+            echo "Upstream release: https://github.com/$UPSTREAM_REPOSITORY/releases/tag/v$VERSION"
+            echo
+            echo "Patches:"
+            for patch in ../patches/*.patch; do
+              [[ -e "$patch" ]] || continue
+              echo "- $(sed -n 's/^Subject: \(\[PATCH[^]]*\] \)\{0,1\}//p' "$patch" | head -n 1)"
+            done
+          } > "$notes"
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" t3-* SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --notes-file "$notes"
+          else
+            gh release create "v$VERSION" t3-* SHA256SUMS \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "T3 Code Unbound v$VERSION" \
+              --notes-file "$notes" \
+              --latest
+          fi
+
+  # A build that stops applying needs a person or an agent; an issue is easier to notice than a red run.
+  report:
+    name: Report failure
+    needs: [resolve, build, publish]
+    if: ${{ failure() && github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Open or update the failure issue
+        shell: bash
+        run: |
+          set -euo pipefail
+          title="Build failed for T3 Code v${VERSION:-unknown}"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')"
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "Failed again: $run_url"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+              --body "The scheduled build could not produce v${VERSION:-unknown}: $run_url
+
+          The usual cause is a patch that no longer applies. Run \`scripts/refresh-patches.sh ${VERSION:-<version>}\`, resolve the conflicts, and push."
+          fi
