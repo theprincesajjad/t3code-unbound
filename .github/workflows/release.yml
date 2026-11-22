@@ -18,6 +18,15 @@ on:
         required: false
         default: false
         type: boolean
+      targets:
+        description: "What to build: the t3 runtime archives, the macOS desktop app, or both."
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - cli
+          - desktop
       publish:
         description: "Publish a GitHub release. Off keeps the archives as workflow artifacts only."
         required: false
@@ -85,7 +94,7 @@ jobs:
   build:
     name: Build ${{ matrix.platform }} ${{ matrix.arch }}
     needs: resolve
-    if: needs.resolve.outputs.build == 'true'
+    if: needs.resolve.outputs.build == 'true' && inputs.targets != 'desktop'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
@@ -221,9 +230,144 @@ jobs:
           compression-level: 0
           retention-days: 14
 
+  # The desktop app bundles its own copy of the web client, so it needs the patches too:
+  # an official desktop app refuses a large file before the patched server ever sees it.
+  desktop:
+    name: Build desktop mac ${{ matrix.arch }}
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true' && inputs.targets != 'cli'
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            rust_target: aarch64-apple-darwin
+          - arch: x64
+            rust_target: x86_64-apple-darwin
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Checkout patches
+        uses: actions/checkout@v4
+        with:
+          path: .unbound
+
+      - name: Checkout upstream
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "https://github.com/$UPSTREAM_REPOSITORY.git"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          base="$(tr -d '[:space:]' < .unbound/patches/BASE)"
+          if [[ -n "$base" && "$base" != "$VERSION" ]]; then
+            git fetch -q --no-tags --depth=1 origin "refs/tags/v$base"
+          fi
+          git fetch -q --no-tags --depth=1 origin "refs/tags/v$VERSION"
+          git -c checkout.workers=0 checkout -q --detach FETCH_HEAD
+          echo ".unbound/" >> .git/info/exclude
+
+      - name: Apply patches
+        shell: bash
+        run: .unbound/scripts/apply-patches.sh
+
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Align package versions to release version
+        shell: bash
+        run: node scripts/update-release-package-versions.ts "$VERSION"
+
+      - name: Load public T3 Connect config
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in T3CODE_CLERK_PUBLISHABLE_KEY T3CODE_CLERK_JWT_TEMPLATE T3CODE_CLERK_CLI_OAUTH_CLIENT_ID T3CODE_RELAY_URL; do
+            value="$(sed -n "s|^$name=||p" .env.example | head -n 1)"
+            if [[ -z "$value" ]]; then
+              echo "::error::.env.example has no $name."
+              exit 1
+            fi
+            echo "$name=$value" >> "$GITHUB_ENV"
+          done
+          echo "T3CODE_TELEMETRY_CHANNEL=dev" >> "$GITHUB_ENV"
+          # The app looks for updates in this repository. No update feed is published here,
+          # so it never replaces itself with an official build that would bring the limit back.
+          echo "T3CODE_DESKTOP_UPDATE_REPOSITORY=$GITHUB_REPOSITORY" >> "$GITHUB_ENV"
+
+      - name: Build JS bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          script="$(node -p "require('./package.json').scripts['build:desktop:bundle'] ? 'build:desktop:bundle' : 'build:desktop'")"
+          vp run "$script"
+
+      - name: Ensure Rosetta for macOS x64 bytecode generation
+        if: matrix.arch == 'x64'
+        shell: bash
+        run: |
+          if [[ "$(uname -m)" == "arm64" ]] && ! /usr/bin/arch -x86_64 /usr/bin/true; then
+            sudo /usr/sbin/softwareupdate --install-rosetta --agree-to-license
+          fi
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Build resource monitor
+        shell: bash
+        run: cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target "${{ matrix.rust_target }}"
+
+      # No Apple signing secrets here, so the app is signed ad hoc. scripts/install-desktop.sh
+      # installs it without the quarantine flag Gatekeeper would otherwise block it on.
+      - name: Build desktop artifact
+        shell: bash
+        env:
+          T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: "true"
+        run: |
+          set -euo pipefail
+          vp run dist:desktop:artifact \
+            --platform mac \
+            --target dmg \
+            --arch "${{ matrix.arch }}" \
+            --build-version "$VERSION" \
+            --skip-build \
+            --verbose
+          ls -la release
+
+      - name: Launch check
+        if: matrix.arch == 'arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mount="$RUNNER_TEMP/desktop-launch-dmg"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$(ls "$GITHUB_WORKSPACE"/release/*.dmg)"
+          trap 'hdiutil detach "$mount" -force >/dev/null || true' EXIT
+          app=$(ls -d "$mount"/*.app)
+          executable=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$app/Contents/Info.plist")
+          node scripts/smoke-desktop-app.ts --artifacts-dir "$RUNNER_TEMP/desktop-launch-check" --executable "$app/Contents/MacOS/$executable"
+
+      - name: Upload desktop app
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-mac-${{ matrix.arch }}
+          path: release/*.dmg
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
   publish:
     name: Publish release
-    needs: [resolve, build]
+    needs: [resolve, build, desktop]
     # A Linux failure must not hold back the macOS archive this machine installs.
     if: ${{ !cancelled() && needs.resolve.outputs.build == 'true' && (github.event_name == 'schedule' || inputs.publish) }}
     runs-on: ubuntu-24.04
@@ -244,17 +388,43 @@ jobs:
           path: release-cli
           merge-multiple: true
 
+      - name: Download desktop apps
+        uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
+          path: release-cli
+          merge-multiple: true
+
       - name: Publish
         shell: bash
+        env:
+          TARGETS: ${{ inputs.targets }}
         run: |
           set -euo pipefail
-          cd release-cli
-          if [[ ! -f "t3-$VERSION-darwin-arm64.tar.gz" ]]; then
-            echo "::error::The macOS arm64 archive is missing, so nothing is published."
+          mkdir -p release-cli && cd release-cli
+          shopt -s nullglob
+          assets=()
+          archives=(t3-*)
+          apps=(*.dmg)
+          if [[ "$TARGETS" != "desktop" ]]; then
+            if [[ ! -f "t3-$VERSION-darwin-arm64.tar.gz" ]]; then
+              echo "::error::The macOS arm64 archive is missing, so nothing is published."
+              exit 1
+            fi
+            # `t3 update` verifies its download against this file.
+            sha256sum "${archives[@]}" > SHA256SUMS
+            cat SHA256SUMS
+            assets+=("${archives[@]}" SHA256SUMS)
+          fi
+          if (( ${#apps[@]} > 0 )); then
+            sha256sum "${apps[@]}" > SHA256SUMS-desktop
+            cat SHA256SUMS-desktop
+            assets+=("${apps[@]}" SHA256SUMS-desktop)
+          fi
+          if (( ${#assets[@]} == 0 )); then
+            echo "::error::Nothing was built, so nothing is published."
             exit 1
           fi
-          sha256sum t3-* > SHA256SUMS
-          cat SHA256SUMS
           notes="$(mktemp)"
           {
             echo "T3 Code $VERSION with the patches in [\`patches/\`](https://github.com/$GITHUB_REPOSITORY/tree/$GITHUB_SHA/patches) applied."
@@ -263,15 +433,14 @@ jobs:
             echo
             echo "Patches:"
             for patch in ../patches/*.patch; do
-              [[ -e "$patch" ]] || continue
               echo "- $(sed -n 's/^Subject: \(\[PATCH[^]]*\] \)\{0,1\}//p' "$patch" | head -n 1)"
             done
           } > "$notes"
           if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "v$VERSION" t3-* SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+            gh release upload "v$VERSION" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
             gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --notes-file "$notes"
           else
-            gh release create "v$VERSION" t3-* SHA256SUMS \
+            gh release create "v$VERSION" "${assets[@]}" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "T3 Code Unbound v$VERSION" \
@@ -282,7 +451,7 @@ jobs:
   # A build that stops applying needs a person or an agent; an issue is easier to notice than a red run.
   report:
     name: Report failure
-    needs: [resolve, build, publish]
+    needs: [resolve, build, desktop, publish]
     if: ${{ failure() && github.event_name == 'schedule' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
