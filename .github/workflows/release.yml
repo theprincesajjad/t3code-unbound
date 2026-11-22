@@ -40,11 +40,21 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
+      actions: write
       contents: read
     outputs:
       version: ${{ steps.resolve.outputs.version }}
       build: ${{ steps.resolve.outputs.build }}
     steps:
+      # GitHub switches off a schedule after 60 days without a commit, and this repository
+      # only gets commits when a patch needs work. Enabling the workflow again resets that clock.
+      - name: Keep the schedule alive
+        if: github.event_name == 'schedule'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/enable" || true
+
       - id: resolve
         name: Resolve version
         shell: bash
