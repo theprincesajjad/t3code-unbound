@@ -236,7 +236,7 @@ jobs:
     name: Build desktop mac ${{ matrix.arch }}
     needs: resolve
     if: needs.resolve.outputs.build == 'true' && inputs.targets != 'cli'
-    runs-on: macos-15
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
       contents: read
@@ -245,8 +245,12 @@ jobs:
       matrix:
         include:
           - arch: arm64
+            runner: macos-15
             rust_target: aarch64-apple-darwin
+          # An Intel runner: under Rosetta the packaging step that starts the app once
+          # to warm its compile cache runs out its two-minute limit.
           - arch: x64
+            runner: macos-15-intel
             rust_target: x86_64-apple-darwin
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
@@ -310,14 +314,6 @@ jobs:
           script="$(node -p "require('./package.json').scripts['build:desktop:bundle'] ? 'build:desktop:bundle' : 'build:desktop'")"
           vp run "$script"
 
-      - name: Ensure Rosetta for macOS x64 bytecode generation
-        if: matrix.arch == 'x64'
-        shell: bash
-        run: |
-          if [[ "$(uname -m)" == "arm64" ]] && ! /usr/bin/arch -x86_64 /usr/bin/true; then
-            sudo /usr/sbin/softwareupdate --install-rosetta --agree-to-license
-          fi
-
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -345,7 +341,6 @@ jobs:
           ls -la release
 
       - name: Launch check
-        if: matrix.arch == 'arm64'
         shell: bash
         run: |
           set -euo pipefail

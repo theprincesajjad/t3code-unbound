@@ -2,3 +2,5 @@ src/
 .DS_Store
 release-cli/
 .grove/
+dist/
+launchd/
