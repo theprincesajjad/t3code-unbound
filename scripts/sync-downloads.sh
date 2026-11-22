@@ -38,6 +38,7 @@ for existing in "$dist"/*.dmg; do
   grep -q -- "  $(basename "$existing")\$" "$sums" || rm -f "$existing"
 done
 cp "$sums" "$dist/SHA256SUMS-desktop"
+chmod 644 "$dist/SHA256SUMS-desktop"
 echo "$version" > "$dist/VERSION"
 
 # The same installer as the repository's, pointed at this folder instead of GitHub.
