@@ -1,0 +1,83 @@
+name: Verify patches
+
+# Applies the patch series to an upstream release, typechecks what it touches, and runs its tests.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "patches/**"
+      - "scripts/apply-patches.sh"
+      - ".github/workflows/verify.yml"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream version to verify against. Empty uses patches/BASE."
+        required: false
+        type: string
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPOSITORY: pingdotgg/t3code
+
+jobs:
+  verify:
+    name: Typecheck and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout patches
+        uses: actions/checkout@v4
+        with:
+          path: .unbound
+
+      - name: Checkout upstream
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          base="$(tr -d '[:space:]' < .unbound/patches/BASE)"
+          version="${INPUT_VERSION#v}"
+          version="${version:-$base}"
+          git init -q .
+          git remote add origin "https://github.com/$UPSTREAM_REPOSITORY.git"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          if [[ "$base" != "$version" ]]; then
+            git fetch -q --no-tags --depth=1 origin "refs/tags/v$base"
+          fi
+          git fetch -q --no-tags --depth=1 origin "refs/tags/v$version"
+          git -c checkout.workers=0 checkout -q --detach FETCH_HEAD
+          echo ".unbound/" >> .git/info/exclude
+
+      - name: Apply patches
+        shell: bash
+        run: .unbound/scripts/apply-patches.sh
+
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=t3... --filter=@t3tools/web...
+
+      - name: Typecheck
+        shell: bash
+        run: >-
+          vp run
+          --filter @t3tools/contracts
+          --filter @t3tools/shared
+          --filter @t3tools/client-runtime
+          --filter t3
+          --filter @t3tools/web
+          typecheck
+
+      - name: Test the patched contract
+        shell: bash
+        working-directory: packages/contracts
+        run: vp test run --config ../../vite.config.ts --dir . src/chatAttachment.unbound.test.ts

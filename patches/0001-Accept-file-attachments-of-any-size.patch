@@ -1,0 +1,703 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theprincesajjad <188352564+theprincesajjad@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 09:12:37 -0500
+Subject: [PATCH] Accept file attachments of any size
+
+Upstream caps a file attachment at 50 MiB in the shared contract, so the
+server, the web client and every reader of a thread enforce it.
+
+The upload limit is now the host's disk. A file past the old limit goes
+up as resumable chunks on the existing signed upload URL, because one
+request cannot carry gigabytes: Node drops a request after five minutes,
+and a dropped connection would restart from zero.
+
+Official desktop and mobile builds still reject a file attachment whose
+sizeBytes exceeds 50 MiB, as would an official server reading this
+database after a rollback. So the stored and transmitted sizeBytes stays
+clamped and the true size travels in actualSizeBytes, a key those readers
+ignore. In memory the attachment carries its true size, so no caller
+changes.
+
+Claiming an upload for a thread now clones it copy-on-write where the
+filesystem can, instead of writing a second full copy.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ apps/server/src/assets/AttachmentUpload.ts    |   4 +-
+ apps/server/src/assets/UnboundUpload.ts       | 181 ++++++++++++++++++
+ .../src/environment/ServerEnvironment.ts      |   4 +-
+ apps/server/src/http.ts                       |  10 +
+ .../src/orchestration-v2/AttachmentClaims.ts  |   3 +-
+ apps/web/src/lib/attachmentUploadQueue.ts     |   6 +
+ apps/web/src/lib/unboundChunkedUpload.ts      | 157 +++++++++++++++
+ .../client-runtime/src/state/attachments.ts   |   7 +-
+ packages/contracts/src/assets.ts              |   4 +-
+ packages/contracts/src/chatAttachment.ts      |  49 ++++-
+ .../src/chatAttachment.unbound.test.ts        |  53 +++++
+ 11 files changed, 462 insertions(+), 16 deletions(-)
+ create mode 100644 apps/server/src/assets/UnboundUpload.ts
+ create mode 100644 apps/web/src/lib/unboundChunkedUpload.ts
+ create mode 100644 packages/contracts/src/chatAttachment.unbound.test.ts
+
+diff --git a/apps/server/src/assets/AttachmentUpload.ts b/apps/server/src/assets/AttachmentUpload.ts
+index d2ea0aea14..d1020a9e45 100644
+--- a/apps/server/src/assets/AttachmentUpload.ts
++++ b/apps/server/src/assets/AttachmentUpload.ts
+@@ -2,7 +2,6 @@
+ import * as NodeCrypto from "node:crypto";
+ import * as NodeFSP from "node:fs/promises";
+ import {
+-  ATTACHMENT_UPLOAD_URL_TTL_MS,
+   type AttachmentCreateUploadUrlInput,
+   AttachmentUploadSigningKeyError,
+ } from "@t3tools/contracts";
+@@ -29,6 +28,7 @@ import {
+ import { resolveAttachmentRelativePath } from "../attachmentPaths.ts";
+ import { base64UrlDecodeUtf8, base64UrlEncode } from "../auth/utils.ts";
+ import * as AssetSigner from "./AssetSigner.ts";
++import { unboundUploadUrlTtlMs } from "./UnboundUpload.ts";
+ import * as ServerConfig from "../config.ts";
+ import { inferImageExtension } from "../imageMime.ts";
+ import * as DocumentText from "../provider/DocumentText.ts";
+@@ -92,7 +92,7 @@ export const issueAttachmentUploadUrl = Effect.fn("AttachmentUpload.issueUrl")(f
+   const attachmentId = createPendingAttachmentId(
+     attachmentType === "file" ? attachmentFileExtension(name) : undefined,
+   );
+-  const expiresAt = nowMs + ATTACHMENT_UPLOAD_URL_TTL_MS;
++  const expiresAt = nowMs + unboundUploadUrlTtlMs(input.sizeBytes);
+   const encodedPayload = base64UrlEncode(
+     encodeAttachmentUploadClaims({
+       version: 1,
+diff --git a/apps/server/src/assets/UnboundUpload.ts b/apps/server/src/assets/UnboundUpload.ts
+new file mode 100644
+index 0000000000..845f5e1856
+--- /dev/null
++++ b/apps/server/src/assets/UnboundUpload.ts
+@@ -0,0 +1,181 @@
++// @effect-diagnostics nodeBuiltinImport:off -- copy-on-write clones and exclusive copies are filesystem boundaries missing from Effect's API.
++/**
++ * Unbound: file attachments of any size.
++ *
++ * Upstream sends an attachment as one POST and caps it at 50 MiB. A multi-gigabyte file needs
++ * more than a larger constant: Node drops a request that takes over five minutes, and a dropped
++ * connection would restart the transfer from zero. So a large file arrives as a sequence of
++ * chunks appended to one partial file, and a retry continues from the bytes already stored.
++ *
++ * The protocol reuses the signed upload URL:
++ *
++ *   POST <upload url>?unbound-offset=<bytes already sent>     body: the next chunk
++ *
++ *   200  chunk stored, more expected      body: bytes stored so far
++ *   201  upload complete                  body: the file size
++ *   409  the offset is not where the file ends; continue from the body's byte count
++ *   423  another request is still writing this upload; retry shortly
++ */
++import * as NodeFSP from "node:fs/promises";
++import { ATTACHMENT_UPLOAD_URL_TTL_MS, PROVIDER_SEND_TURN_MAX_FILE_BYTES } from "@t3tools/contracts";
++import * as Effect from "effect/Effect";
++import * as FileSystem from "effect/FileSystem";
++import * as Path from "effect/Path";
++import * as Stream from "effect/Stream";
++import { HttpServerResponse, type HttpServerRequest } from "effect/http";
++
++import { attachmentFileExtension } from "../attachmentStore.ts";
++import { resolveAttachmentRelativePath } from "../attachmentPaths.ts";
++import * as ServerConfig from "../config.ts";
++import * as DocumentText from "../provider/DocumentText.ts";
++
++export const UNBOUND_UPLOAD_OFFSET_PARAM = "unbound-offset";
++
++/** A chunked upload makes many requests with one URL, over hours on a slow link. */
++const UNBOUND_LARGE_UPLOAD_URL_TTL_MS = 7 * 24 * 60 * 60 * 1000;
++
++export function unboundUploadUrlTtlMs(sizeBytes: number): number {
++  return sizeBytes > PROVIDER_SEND_TURN_MAX_FILE_BYTES
++    ? UNBOUND_LARGE_UPLOAD_URL_TTL_MS
++    : ATTACHMENT_UPLOAD_URL_TTL_MS;
++}
++
++/**
++ * Claiming an upload for a thread copies it, and the pending original stays for a day. A
++ * copy-on-write clone makes that instant and free on APFS, Btrfs and XFS; elsewhere it is a copy.
++ */
++export const cloneOrCopyFile = (fromPath: string, toPath: string) =>
++  Effect.tryPromise({
++    try: () => NodeFSP.copyFile(fromPath, toPath, NodeFSP.constants.COPYFILE_FICLONE),
++    catch: (cause) => cause,
++  });
++
++interface UnboundUploadClaims {
++  readonly type: "image" | "file";
++  readonly attachmentId: string;
++  readonly name: string;
++  readonly sizeBytes: number;
++}
++
++type ChunkOutcome =
++  | { readonly status: 200 | 201 | 409; readonly receivedBytes: number }
++  | { readonly status: 400 | 423 | 500; readonly detail: string };
++
++/** One writer per upload: two requests appending to the same partial file would interleave. */
++const activeUploads = new Set<string>();
++
++const storeChunk = Effect.fn("UnboundUpload.storeChunk")(function* (
++  claims: UnboundUploadClaims,
++  offset: number,
++  body: HttpServerRequest.HttpServerRequest["stream"],
++) {
++  const config = yield* ServerConfig.ServerConfig;
++  const fileSystem = yield* FileSystem.FileSystem;
++  const path = yield* Path.Path;
++  const relativePath = `${claims.attachmentId}${attachmentFileExtension(claims.name)}`;
++  const finalPath = resolveAttachmentRelativePath({
++    attachmentsDir: config.attachmentsDir,
++    relativePath,
++  });
++  // The stale-upload sweep removes `.part` files an hour after their last write.
++  const partPath = resolveAttachmentRelativePath({
++    attachmentsDir: config.attachmentsDir,
++    relativePath: `${relativePath}.unbound.part`,
++  });
++  if (!finalPath || !partPath) {
++    return { status: 500, detail: "Failed to resolve attachment path." } satisfies ChunkOutcome;
++  }
++  const sizeOf = (file: string) =>
++    fileSystem.stat(file).pipe(
++      Effect.map((info) => Number(info.size)),
++      Effect.orElseSucceed(() => null),
++    );
++
++  // A client that lost the final response asks again; the upload is already published.
++  const publishedBytes = yield* sizeOf(finalPath);
++  if (publishedBytes !== null) {
++    return publishedBytes === claims.sizeBytes
++      ? ({ status: 201, receivedBytes: publishedBytes } satisfies ChunkOutcome)
++      : ({ status: 400, detail: "Attachment already uploaded." } satisfies ChunkOutcome);
++  }
++
++  yield* fileSystem.makeDirectory(path.dirname(finalPath), { recursive: true });
++  const storedBytes = (yield* sizeOf(partPath)) ?? 0;
++  if (offset !== storedBytes) {
++    return { status: 409, receivedBytes: storedBytes } satisfies ChunkOutcome;
++  }
++
++  const remainingBytes = claims.sizeBytes - offset;
++  let chunkBytes = 0;
++  yield* Stream.run(
++    body.pipe(
++      Stream.takeWhile((chunk) => {
++        chunkBytes += chunk.byteLength;
++        return chunkBytes <= remainingBytes;
++      }),
++    ),
++    fileSystem.sink(partPath, { flag: "a" }),
++  );
++  if (chunkBytes > remainingBytes) {
++    yield* fileSystem.truncate(partPath, offset);
++    return {
++      status: 400,
++      detail: `Chunk runs past the upload size of ${claims.sizeBytes} bytes.`,
++    } satisfies ChunkOutcome;
++  }
++  const receivedBytes = offset + chunkBytes;
++  if (receivedBytes < claims.sizeBytes) {
++    return { status: 200, receivedBytes } satisfies ChunkOutcome;
++  }
++
++  // Publishing without replacement keeps an upload and its cached text immutable.
++  yield* fileSystem.link(partPath, finalPath).pipe(
++    Effect.catch(() =>
++      Effect.tryPromise({
++        try: () => NodeFSP.copyFile(partPath, finalPath, NodeFSP.constants.COPYFILE_EXCL),
++        catch: (cause) => cause,
++      }),
++    ),
++  );
++  yield* fileSystem.remove(partPath, { force: true }).pipe(Effect.ignore);
++  const documents = yield* DocumentText.DocumentText;
++  yield* documents.ensure(finalPath);
++  return { status: 201, receivedBytes } satisfies ChunkOutcome;
++});
++
++/** Answers one chunk of a large upload. The caller has already verified the signed URL. */
++export const respondToAttachmentUploadChunk = Effect.fn("UnboundUpload.respond")(function* (
++  claims: UnboundUploadClaims,
++  rawOffset: string,
++  request: HttpServerRequest.HttpServerRequest,
++) {
++  const offset = /^\d{1,16}$/.test(rawOffset) ? Number(rawOffset) : Number.NaN;
++  if (claims.type !== "file" || !Number.isSafeInteger(offset) || offset > claims.sizeBytes) {
++    return HttpServerResponse.text("Invalid chunked upload request.", { status: 400 });
++  }
++  if (activeUploads.has(claims.attachmentId)) {
++    return HttpServerResponse.text("Another request is writing this upload.", { status: 423 });
++  }
++  activeUploads.add(claims.attachmentId);
++  // Keep the request stream in the route scope until the response is sent.
++  const bodyPull = yield* Stream.toPull(request.stream);
++  const outcome: ChunkOutcome = yield* storeChunk(
++    claims,
++    offset,
++    Stream.fromPull(Effect.succeed(bodyPull)),
++  ).pipe(
++    Effect.catch((cause) =>
++      Effect.logError("Failed to persist attachment upload chunk.", {
++        attachmentId: claims.attachmentId,
++        offset,
++        cause,
++      }).pipe(
++        Effect.as({ status: 500, detail: "Failed to persist upload." } satisfies ChunkOutcome),
++      ),
++    ),
++    Effect.ensuring(Effect.sync(() => activeUploads.delete(claims.attachmentId))),
++  );
++  return "detail" in outcome
++    ? HttpServerResponse.text(outcome.detail, { status: outcome.status })
++    : HttpServerResponse.text(String(outcome.receivedBytes), { status: outcome.status });
++});
+diff --git a/apps/server/src/environment/ServerEnvironment.ts b/apps/server/src/environment/ServerEnvironment.ts
+index a9dfdcb6e6..ed17c7e3ac 100644
+--- a/apps/server/src/environment/ServerEnvironment.ts
++++ b/apps/server/src/environment/ServerEnvironment.ts
+@@ -1,7 +1,7 @@
+ import {
+   EnvironmentId,
+   ORCHESTRATION_PROTOCOL_VERSION,
+-  PROVIDER_SEND_TURN_MAX_FILE_BYTES,
++  UNBOUND_MAX_FILE_BYTES,
+   type ExecutionEnvironmentDescriptor,
+ } from "@t3tools/contracts";
+ import * as HostProcess from "@t3tools/shared/HostProcess";
+@@ -225,7 +225,7 @@ export const make = Effect.gen(function* () {
+       attachmentUploads: true,
+       accessTokenRenewal: true,
+       questionAttachments: true,
+-      fileAttachments: { maxUploadBytes: PROVIDER_SEND_TURN_MAX_FILE_BYTES },
++      fileAttachments: { maxUploadBytes: UNBOUND_MAX_FILE_BYTES },
+       pullRequests: true,
+       pullRequestChecks: true,
+       issues: true,
+diff --git a/apps/server/src/http.ts b/apps/server/src/http.ts
+index 44bca4bf20..f89c2a2252 100644
+--- a/apps/server/src/http.ts
++++ b/apps/server/src/http.ts
+@@ -40,6 +40,10 @@ import {
+   storeAttachmentUpload,
+   validateAttachmentUploadToken,
+ } from "./assets/AttachmentUpload.ts";
++import {
++  respondToAttachmentUploadChunk,
++  UNBOUND_UPLOAD_OFFSET_PARAM,
++} from "./assets/UnboundUpload.ts";
+ import * as BrowserTraceCollector from "./observability/BrowserTraceCollector.ts";
+ import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
+ import { traceRelayRequest } from "./cloud/traceRelayRequest.ts";
+@@ -536,6 +540,12 @@ export const layerAttachmentUploadRoute = HttpRouter.add(
+       return HttpServerResponse.text("Not Found", { status: 404 });
+     }
+ 
++    // Unbound: a large file arrives as resumable chunks on the same signed URL.
++    const chunkOffset = url.value.searchParams.get(UNBOUND_UPLOAD_OFFSET_PARAM);
++    if (chunkOffset !== null) {
++      return yield* respondToAttachmentUploadChunk(claims, chunkOffset, request);
++    }
++
+     const contentLengthHeader = request.headers["content-length"];
+     if (
+       contentLengthHeader !== undefined &&
+diff --git a/apps/server/src/orchestration-v2/AttachmentClaims.ts b/apps/server/src/orchestration-v2/AttachmentClaims.ts
+index be48ef68b5..bb1850e587 100644
+--- a/apps/server/src/orchestration-v2/AttachmentClaims.ts
++++ b/apps/server/src/orchestration-v2/AttachmentClaims.ts
+@@ -14,6 +14,7 @@ import {
+   planAttachmentClaim,
+   resolveAttachmentPath,
+ } from "../attachmentStore.ts";
++import { cloneOrCopyFile } from "../assets/UnboundUpload.ts";
+ import * as ServerConfig from "../config.ts";
+ import * as DocumentText from "../provider/DocumentText.ts";
+ 
+@@ -138,7 +139,7 @@ export const claimPendingAttachments = Effect.fn("AttachmentClaims.claimPendingA
+           }
+           // Copies isolate edits from the retry source. Keep the uncancellable copy and rollback registration
+           // uninterruptible so cleanup always sees completed writes.
+-          yield* fileSystem.copyFile(claim.currentPath, claim.finalPath).pipe(
++          yield* cloneOrCopyFile(claim.currentPath, claim.finalPath).pipe(
+             Effect.mapError(
+               (cause) =>
+                 new AttachmentClaimError({
+diff --git a/apps/web/src/lib/attachmentUploadQueue.ts b/apps/web/src/lib/attachmentUploadQueue.ts
+index 6c9393e43b..8d02a5bbe6 100644
+--- a/apps/web/src/lib/attachmentUploadQueue.ts
++++ b/apps/web/src/lib/attachmentUploadQueue.ts
+@@ -39,6 +39,10 @@ import { attachmentEnvironment } from "../state/attachments";
+ import { readEnvironmentScope, readPreparedConnection } from "../state/session";
+ import type { AttachmentUploadState, ReadyAttachmentUpload } from "./attachmentUploadState";
+ import { m } from "../i18n/messages";
++import {
++  UNBOUND_CHUNKED_UPLOAD_THRESHOLD_BYTES,
++  uploadBytesInChunks,
++} from "./unboundChunkedUpload";
+ 
+ const MAX_UPLOADS_PER_ENVIRONMENT = 3;
+ const UPLOAD_TIMEOUT_MS = 5 * 60_000;
+@@ -149,6 +153,8 @@ function uploadBytes(input: {
+   readonly signal: AbortSignal;
+   readonly onProgress: (progress: number) => void;
+ }): Promise<void> {
++  // Unbound: a file past the upstream limit goes up in resumable chunks.
++  if (input.file.size > UNBOUND_CHUNKED_UPLOAD_THRESHOLD_BYTES) return uploadBytesInChunks(input);
+   const xhr = new XMLHttpRequest();
+   return new Promise<void>((resolve, reject) => {
+     xhr.open("POST", input.url, true);
+diff --git a/apps/web/src/lib/unboundChunkedUpload.ts b/apps/web/src/lib/unboundChunkedUpload.ts
+new file mode 100644
+index 0000000000..4daca92de0
+--- /dev/null
++++ b/apps/web/src/lib/unboundChunkedUpload.ts
+@@ -0,0 +1,157 @@
++/**
++ * Unbound: sends a large attachment as resumable chunks.
++ *
++ * One request per file cannot carry gigabytes: the server drops a request that takes over five
++ * minutes, and a dropped connection would restart from zero. Each chunk is a short request, and
++ * the server reports how many bytes it holds, so a retry continues from there. The protocol is
++ * documented in apps/server/src/assets/UnboundUpload.ts.
++ */
++import { PROVIDER_SEND_TURN_MAX_FILE_BYTES } from "@t3tools/contracts";
++import { msg } from "gt-react";
++
++import { m } from "../i18n/messages";
++
++/** Files up to the upstream limit keep upstream's single request, which official servers accept. */
++export const UNBOUND_CHUNKED_UPLOAD_THRESHOLD_BYTES = PROVIDER_SEND_TURN_MAX_FILE_BYTES;
++
++const UPLOAD_OFFSET_PARAM = "unbound-offset";
++/** Small enough to finish inside the server's five-minute request limit at about 0.5 Mbit/s. */
++const CHUNK_BYTES = 16 * 1024 * 1024;
++/** No bytes acknowledged for this long means the connection is dead, however slow the link. */
++const STALL_TIMEOUT_MS = 90_000;
++/** Consecutive attempts that stored nothing new before the upload gives up. */
++const MAX_FRUITLESS_ATTEMPTS = 8;
++const MAX_RETRY_DELAY_MS = 30_000;
++
++interface ChunkResponse {
++  readonly status: number;
++  readonly body: string;
++}
++
++class UploadCancelledError extends Error {}
++
++function sendChunk(input: {
++  readonly url: string;
++  readonly chunk: Blob;
++  readonly mimeType: string;
++  readonly signal: AbortSignal;
++  readonly onChunkProgress: (loadedBytes: number) => void;
++}): Promise<ChunkResponse> {
++  const xhr = new XMLHttpRequest();
++  return new Promise<ChunkResponse>((resolve, reject) => {
++    let stallTimer: ReturnType<typeof setTimeout> | undefined;
++    const armStallTimer = () => {
++      clearTimeout(stallTimer);
++      stallTimer = setTimeout(() => {
++        reject(new Error(m(msg("Upload timed out"))));
++        xhr.abort();
++      }, STALL_TIMEOUT_MS);
++    };
++    const onAbort = () => {
++      reject(new UploadCancelledError(m(msg("Upload cancelled"))));
++      xhr.abort();
++    };
++    const settle = () => {
++      clearTimeout(stallTimer);
++      input.signal.removeEventListener("abort", onAbort);
++    };
++    xhr.open("POST", input.url, true);
++    xhr.setRequestHeader("Content-Type", input.mimeType);
++    xhr.upload.addEventListener("progress", (event) => {
++      armStallTimer();
++      input.onChunkProgress(event.loaded);
++    });
++    xhr.addEventListener("load", () => {
++      settle();
++      resolve({ status: xhr.status, body: xhr.responseText });
++    });
++    xhr.addEventListener("error", () => {
++      settle();
++      reject(new Error(m(msg("Upload failed"))));
++    });
++    xhr.addEventListener("abort", settle);
++    input.signal.addEventListener("abort", onAbort, { once: true });
++    armStallTimer();
++    xhr.send(input.chunk);
++  });
++}
++
++function wait(delayMs: number, signal: AbortSignal): Promise<void> {
++  return new Promise((resolve) => {
++    const done = () => {
++      clearTimeout(timer);
++      signal.removeEventListener("abort", done);
++      resolve();
++    };
++    const timer = setTimeout(done, delayMs);
++    signal.addEventListener("abort", done, { once: true });
++  });
++}
++
++function parseStoredBytes(body: string, fileSize: number): number | null {
++  const storedBytes = /^\d{1,16}$/.test(body.trim()) ? Number(body.trim()) : Number.NaN;
++  return Number.isSafeInteger(storedBytes) && storedBytes <= fileSize ? storedBytes : null;
++}
++
++export async function uploadBytesInChunks(input: {
++  readonly url: string;
++  readonly file: File;
++  readonly mimeType: string;
++  readonly signal: AbortSignal;
++  readonly onProgress: (progress: number) => void;
++}): Promise<void> {
++  const fileSize = input.file.size;
++  let offset = 0;
++  let fruitlessAttempts = 0;
++  let lastError: Error = new Error(m(msg("Upload failed")));
++
++  while (true) {
++    if (input.signal.aborted) throw new UploadCancelledError(m(msg("Upload cancelled")));
++    if (fruitlessAttempts >= MAX_FRUITLESS_ATTEMPTS) throw lastError;
++    if (fruitlessAttempts > 0) {
++      await wait(Math.min(MAX_RETRY_DELAY_MS, 500 * 2 ** fruitlessAttempts), input.signal);
++      if (input.signal.aborted) throw new UploadCancelledError(m(msg("Upload cancelled")));
++    }
++
++    const chunkStart = offset;
++    const url = new URL(input.url, window.location.href);
++    url.searchParams.set(UPLOAD_OFFSET_PARAM, String(chunkStart));
++    let response: ChunkResponse;
++    try {
++      response = await sendChunk({
++        url: url.toString(),
++        chunk: input.file.slice(chunkStart, Math.min(chunkStart + CHUNK_BYTES, fileSize)),
++        mimeType: input.mimeType,
++        signal: input.signal,
++        onChunkProgress: (loadedBytes) =>
++          input.onProgress(Math.min(1, (chunkStart + loadedBytes) / fileSize)),
++      });
++    } catch (error) {
++      if (error instanceof UploadCancelledError) throw error;
++      // A dropped connection may still have stored part of the chunk; the next attempt asks.
++      lastError = error instanceof Error ? error : lastError;
++      fruitlessAttempts += 1;
++      continue;
++    }
++
++    if (response.status === 201) {
++      input.onProgress(1);
++      return;
++    }
++    if (response.status === 200 || response.status === 409) {
++      // On 409 the server's count wins: it holds more, or less, than this client assumed.
++      const storedBytes = parseStoredBytes(response.body, fileSize);
++      if (storedBytes === null) {
++        throw new Error(m(msg("Upload rejected ({status})", { status: response.status })));
++      }
++      fruitlessAttempts = storedBytes > offset ? 0 : fruitlessAttempts + 1;
++      offset = storedBytes;
++      input.onProgress(offset / fileSize);
++      continue;
++    }
++    lastError = new Error(m(msg("Upload rejected ({status})", { status: response.status })));
++    // Busy (423) and server or proxy errors pass; anything else will not improve on a retry.
++    if (response.status !== 423 && response.status < 500) throw lastError;
++    fruitlessAttempts += 1;
++  }
++}
+diff --git a/packages/client-runtime/src/state/attachments.ts b/packages/client-runtime/src/state/attachments.ts
+index 03494e139f..afc84a7c1e 100644
+--- a/packages/client-runtime/src/state/attachments.ts
++++ b/packages/client-runtime/src/state/attachments.ts
+@@ -1,5 +1,4 @@
+ import {
+-  PROVIDER_SEND_TURN_MAX_FILE_BYTES,
+   WS_METHODS,
+   type AttachmentCreateUploadUrlInput,
+   type AttachmentCreateUploadUrlResult,
+@@ -197,11 +196,11 @@ export function runAttachmentUploadCycle<E, RE, TE>(input: {
+ }
+ 
+ /**
+- * The contract caps what a turn may reference, so a larger advertised value must not admit
+- * files the send would then refuse.
++ * Unbound: the server's advertised limit stands. Upstream clamps it to the 50 MiB a turn may
++ * reference there; here a larger file is sent with its true size alongside (see `ChatFileAttachment`).
+  */
+ export function clampFileAttachmentUploadBytes(advertisedMaxUploadBytes: number): number {
+-  return Math.min(advertisedMaxUploadBytes, PROVIDER_SEND_TURN_MAX_FILE_BYTES);
++  return advertisedMaxUploadBytes;
+ }
+ 
+ export function formatAttachmentSize(
+diff --git a/packages/contracts/src/assets.ts b/packages/contracts/src/assets.ts
+index 0cae763748..57e2b01681 100644
+--- a/packages/contracts/src/assets.ts
++++ b/packages/contracts/src/assets.ts
+@@ -2,9 +2,9 @@ import * as Schema from "effect/Schema";
+ 
+ import { NonNegativeInt, ThreadId, TrimmedNonEmptyString, TurnItemId } from "./baseSchemas.ts";
+ import {
+-  PROVIDER_SEND_TURN_MAX_FILE_BYTES,
+   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
+   PROVIDER_SEND_TURN_SUPPORTED_IMAGE_MIME_TYPES,
++  UNBOUND_MAX_FILE_BYTES,
+ } from "./chatAttachment.ts";
+ import { ProjectFaviconPath } from "./project.ts";
+ import { ToolActivityNativeAppReference } from "./providerRuntime.ts";
+@@ -122,7 +122,7 @@ const FileAttachmentCreateUploadUrlInput = Schema.Struct({
+   mimeType: TrimmedNonEmptyString.check(Schema.isMaxLength(100)),
+   sizeBytes: NonNegativeInt.check(
+     Schema.isGreaterThanOrEqualTo(1),
+-    Schema.isLessThanOrEqualTo(PROVIDER_SEND_TURN_MAX_FILE_BYTES),
++    Schema.isLessThanOrEqualTo(UNBOUND_MAX_FILE_BYTES),
+   ),
+ });
+ 
+diff --git a/packages/contracts/src/chatAttachment.ts b/packages/contracts/src/chatAttachment.ts
+index bc3e103d74..dc1ee4218e 100644
+--- a/packages/contracts/src/chatAttachment.ts
++++ b/packages/contracts/src/chatAttachment.ts
+@@ -1,4 +1,5 @@
+ import * as Schema from "effect/Schema";
++import * as SchemaTransformation from "effect/SchemaTransformation";
+ 
+ import {
+   IsoDateTime,
+@@ -14,7 +15,13 @@ export const PROVIDER_SEND_TURN_MAX_INPUT_CHARS = 120_000;
+ export const PROVIDER_SEND_TURN_MAX_ATTACHMENTS = 100;
+ export const PROVIDER_SEND_TURN_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+ const PROVIDER_SEND_TURN_MAX_TOTAL_IMAGE_BYTES = 80 * 1024 * 1024;
++/**
++ * Unbound: no longer the upload limit, only the largest file size upstream readers accept in a
++ * stored or transmitted attachment. See `ChatFileAttachment`.
++ */
+ export const PROVIDER_SEND_TURN_MAX_FILE_BYTES = 50 * 1024 * 1024;
++/** Unbound: uploads are bounded by the host's disk, not by a constant. */
++export const UNBOUND_MAX_FILE_BYTES = Number.MAX_SAFE_INTEGER;
+ export const PROVIDER_SEND_TURN_SUPPORTED_IMAGE_MIME_TYPES = [
+   "image/gif",
+   "image/jpeg",
+@@ -158,18 +165,50 @@ export type ChatImageAttachment = typeof ChatImageAttachment.Type;
+ export const PastedTextAttachmentSource = Schema.TaggedStruct("pasted-text", {});
+ export type PastedTextAttachmentSource = typeof PastedTextAttachmentSource.Type;
+ 
+-export const ChatFileAttachment = Schema.Struct({
++const chatFileAttachmentFields = {
+   type: Schema.Literal("file"),
+   id: ChatAttachmentId,
+   name: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
+   mimeType: TrimmedNonEmptyString.check(Schema.isMaxLength(100)),
+-  sizeBytes: NonNegativeInt.check(
+-    Schema.isGreaterThanOrEqualTo(1),
+-    Schema.isLessThanOrEqualTo(PROVIDER_SEND_TURN_MAX_FILE_BYTES),
+-  ),
++  sizeBytes: NonNegativeInt.check(Schema.isGreaterThanOrEqualTo(1)),
+   /** Keep path-only so agents inspect selectively without consuming the context folding preserves. */
+   source: Schema.optional(PastedTextAttachmentSource),
++};
++
++/**
++ * Unbound: the stored and transmitted shape. Official desktop and mobile builds, and an official
++ * server reading this database after a rollback, reject a `file` attachment whose `sizeBytes`
++ * exceeds 50 MiB, which would break every thread holding one. So `sizeBytes` is written clamped
++ * and the true size travels in `actualSizeBytes`, a key those readers ignore.
++ */
++const ChatFileAttachmentWire = Schema.Struct({
++  ...chatFileAttachmentFields,
++  actualSizeBytes: Schema.optional(NonNegativeInt),
+ });
++const ChatFileAttachmentValue = Schema.Struct(chatFileAttachmentFields);
++
++export const ChatFileAttachment = ChatFileAttachmentWire.pipe(
++  Schema.decodeTo(
++    ChatFileAttachmentValue,
++    SchemaTransformation.transform<
++      typeof ChatFileAttachmentValue.Encoded,
++      typeof ChatFileAttachmentWire.Type
++    >({
++      decode: ({ actualSizeBytes, ...attachment }) =>
++        actualSizeBytes !== undefined && actualSizeBytes > attachment.sizeBytes
++          ? { ...attachment, sizeBytes: actualSizeBytes }
++          : attachment,
++      encode: (attachment) =>
++        attachment.sizeBytes > PROVIDER_SEND_TURN_MAX_FILE_BYTES
++          ? {
++              ...attachment,
++              sizeBytes: PROVIDER_SEND_TURN_MAX_FILE_BYTES,
++              actualSizeBytes: attachment.sizeBytes,
++            }
++          : attachment,
++    }),
++  ),
++);
+ export type ChatFileAttachment = typeof ChatFileAttachment.Type;
+ 
+ /** Accepts unknown attachment types for older readers; malformed known types must fail their own schema. */
+diff --git a/packages/contracts/src/chatAttachment.unbound.test.ts b/packages/contracts/src/chatAttachment.unbound.test.ts
+new file mode 100644
+index 0000000000..8185905b12
+--- /dev/null
++++ b/packages/contracts/src/chatAttachment.unbound.test.ts
+@@ -0,0 +1,53 @@
++import { assert, it } from "@effect/vitest";
++import * as Effect from "effect/Effect";
++import * as Schema from "effect/Schema";
++
++import { ChatAttachment, PROVIDER_SEND_TURN_MAX_FILE_BYTES } from "./chatAttachment.ts";
++
++const decodeAttachment = Schema.decodeUnknownEffect(ChatAttachment);
++const encodeAttachment = Schema.encodeEffect(ChatAttachment);
++
++const file = {
++  type: "file" as const,
++  id: "thread-1-00000000-0000-4000-8000-000000000003-bin",
++  name: "dataset.bin",
++  mimeType: "application/octet-stream",
++};
++const threeGiB = 3 * 1024 * 1024 * 1024;
++
++it.effect("writes a large file in the shape upstream readers accept", () =>
++  Effect.gen(function* () {
++    const encoded = yield* encodeAttachment({ ...file, sizeBytes: threeGiB });
++    assert.deepStrictEqual(encoded, {
++      ...file,
++      sizeBytes: PROVIDER_SEND_TURN_MAX_FILE_BYTES,
++      actualSizeBytes: threeGiB,
++    });
++  }),
++);
++
++it.effect("reads a large file back at its true size", () =>
++  Effect.gen(function* () {
++    const decoded = yield* decodeAttachment({
++      ...file,
++      sizeBytes: PROVIDER_SEND_TURN_MAX_FILE_BYTES,
++      actualSizeBytes: threeGiB,
++    });
++    assert.deepStrictEqual(decoded, { ...file, sizeBytes: threeGiB });
++  }),
++);
++
++it.effect("leaves a file within the upstream limit exactly as upstream writes it", () =>
++  Effect.gen(function* () {
++    const attachment = { ...file, sizeBytes: PROVIDER_SEND_TURN_MAX_FILE_BYTES };
++    assert.deepStrictEqual(yield* encodeAttachment(attachment), attachment);
++    assert.deepStrictEqual(yield* decodeAttachment(attachment), attachment);
++  }),
++);
++
++it.effect("reads a size above the upstream limit that was stored without the true-size key", () =>
++  Effect.gen(function* () {
++    const decoded = yield* decodeAttachment({ ...file, sizeBytes: threeGiB });
++    assert.strictEqual(decoded.sizeBytes, threeGiB);
++  }),
++);

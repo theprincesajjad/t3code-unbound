@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theprincesajjad <188352564+theprincesajjad@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 09:12:37 -0500
+Subject: [PATCH] Point t3 update at the patched releases
+
+The official release index would replace a patched build with an
+unpatched one on the next update.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ packages/shared/src/cliRelease.ts | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/packages/shared/src/cliRelease.ts b/packages/shared/src/cliRelease.ts
+index 07a0c73b17..67514c3c2f 100644
+--- a/packages/shared/src/cliRelease.ts
++++ b/packages/shared/src/cliRelease.ts
+@@ -3,7 +3,8 @@ import * as Schema from "effect/Schema";
+ 
+ import { compareSemverVersions } from "./semver.ts";
+ 
+-const CLI_RELEASE_REPOSITORY = "pingdotgg/t3code";
++// Unbound: `t3 update` follows the patched builds, not the official ones it would replace them with.
++const CLI_RELEASE_REPOSITORY = "theprincesajjad/t3code-unbound";
+ export const CLI_RELEASES_PAGE_URL = `https://github.com/${CLI_RELEASE_REPOSITORY}/releases`;
+ export const CLI_RELEASE_CHECKSUMS_FILE = "SHA256SUMS";
+ export const CLI_RELEASE_BASE_URL_ENV = "T3CODE_RELEASE_BASE_URL";
