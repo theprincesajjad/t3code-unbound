@@ -10,6 +10,8 @@
 #
 #   T3_UNBOUND_BASE     where the files are (default: this repository's latest release)
 #   T3_UNBOUND_VERSION  version to install (default: the newest at that location)
+#   T3_UNBOUND_APPS_DIR folder to install into (default: /Applications)
+#   T3_UNBOUND_NO_OPEN  set to 1 to leave the app closed after installing
 set -eu
 
 repo="theprincesajjad/t3code-unbound"
@@ -60,7 +62,8 @@ hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$work/$file" >/dev/null
 app="$(ls -d "$mount"/*.app 2>/dev/null | head -n 1)"
 [ -n "$app" ] || fail "the disk image holds no app."
 name="$(basename "$app")"
-target="/Applications/$name"
+apps_dir="${T3_UNBOUND_APPS_DIR:-/Applications}"
+target="$apps_dir/$name"
 
 if pgrep -f "$target/Contents/MacOS/" >/dev/null 2>&1; then
   echo "Quitting ${name%.app}"
@@ -73,5 +76,9 @@ rm -rf "$target"
 ditto "$app" "$target"
 xattr -dr com.apple.quarantine "$target" 2>/dev/null || true
 
-echo "Installed ${name%.app}. Opening it."
-open "$target"
+if [ "${T3_UNBOUND_NO_OPEN:-}" = "1" ]; then
+  echo "Installed ${name%.app} in $apps_dir."
+else
+  echo "Installed ${name%.app}. Opening it."
+  open "$target"
+fi

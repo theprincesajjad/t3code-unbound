@@ -34,6 +34,26 @@ curl -fsSL https://t3.codes/install.sh | \
 
 Archives are built for macOS arm64, Linux x64 and Linux arm64.
 
+### Desktop app (macOS)
+
+The desktop app bundles its own copy of the client, so it needs the patch too.
+Each release carries a build for Apple Silicon and one for Intel:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/theprincesajjad/t3code-unbound/main/scripts/install-desktop.sh | sh
+```
+
+The script downloads the build for that Mac, checks its SHA-256, and copies it
+into `/Applications` as "T3 Code (Beta)". Run it again to update. It replaces an
+official "T3 Code (Beta)" and keeps its saved connections; "T3 Code (Nightly)"
+is a separate app and is left alone.
+
+The app is signed ad hoc, not by an Apple developer account. Downloaded with
+`curl` it opens normally. A disk image downloaded in a browser is quarantined,
+so after copying the app run
+`xattr -dr com.apple.quarantine "/Applications/T3 Code (Beta).app"`.
+It does not update itself: an official update would bring the limit back.
+
 ## Update
 
 ```sh
@@ -78,10 +98,10 @@ change. Threads holding large files stay readable there: see below.
 
 ## Limits
 
-- Only clients carrying the patch can *send* a large file: the web UI this
-  server serves (open the server's address in a browser, on any device). The
-  official desktop and mobile apps keep their own 50 MB check until they are
-  rebuilt with the patch. They can open and read threads that contain large files.
+- Only clients carrying the patch can *send* a large file: the desktop app
+  built here, and the web UI the server serves (open the server's address in a
+  browser, on any device). The official desktop and mobile apps keep their own
+  50 MB check. They can open and read threads that contain large files.
 - A file must fit on the host's disk. There is no quota.
 - Images keep upstream's 10 MB limit; the client already compresses larger ones.
 - Agents receive the file's path, not its bytes, so a large file costs no context.
@@ -107,5 +127,7 @@ run `git rebase --continue`, and run the script again.
 | `scripts/apply-patches.sh` | Applies the series to an upstream checkout |
 | `scripts/refresh-patches.sh` | Rebases the series onto a new upstream release |
 | `scripts/install.sh` | Switches a machine from an official build to this one |
+| `scripts/install-desktop.sh` | Installs or updates the macOS desktop app |
+| `scripts/sync-downloads.sh` | Mirrors the newest desktop apps into `dist/` for serving on a private network |
 
 T3 Code is MIT licensed, and so are these patches.
