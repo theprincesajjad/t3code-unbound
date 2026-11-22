@@ -45,7 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/theprincesajjad/t3code-unbound/main
 
 The script downloads the build for that Mac, checks its SHA-256, and copies it
 into `/Applications` as "T3 Code (Beta)". Run it again to update. It replaces an
-official "T3 Code (Beta)" and keeps its saved connections; "T3 Code (Nightly)"
+official "T3 Code (Beta)" of the same name; "T3 Code (Nightly)"
 is a separate app and is left alone.
 
 The app is signed ad hoc, not by an Apple developer account. Downloaded with
