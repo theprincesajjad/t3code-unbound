@@ -24,17 +24,17 @@ filesystem can, instead of writing a second full copy.
 Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
 ---
  apps/server/src/assets/AttachmentUpload.ts    |   4 +-
- apps/server/src/assets/UnboundUpload.ts       | 181 ++++++++++++++++++
+ apps/server/src/assets/UnboundUpload.ts       | 190 ++++++++++++++++++
  .../src/environment/ServerEnvironment.ts      |   4 +-
  apps/server/src/http.ts                       |  10 +
  .../src/orchestration-v2/AttachmentClaims.ts  |   3 +-
  apps/web/src/lib/attachmentUploadQueue.ts     |   6 +
- apps/web/src/lib/unboundChunkedUpload.ts      | 155 +++++++++++++++
+ apps/web/src/lib/unboundChunkedUpload.ts      | 155 ++++++++++++++
  .../client-runtime/src/state/attachments.ts   |   7 +-
  packages/contracts/src/assets.ts              |   4 +-
  packages/contracts/src/chatAttachment.ts      |  49 ++++-
  .../src/chatAttachment.unbound.test.ts        |  53 +++++
- 11 files changed, 460 insertions(+), 16 deletions(-)
+ 11 files changed, 469 insertions(+), 16 deletions(-)
  create mode 100644 apps/server/src/assets/UnboundUpload.ts
  create mode 100644 apps/web/src/lib/unboundChunkedUpload.ts
  create mode 100644 packages/contracts/src/chatAttachment.unbound.test.ts
@@ -70,10 +70,10 @@ index d2ea0aea14..d1020a9e45 100644
        version: 1,
 diff --git a/apps/server/src/assets/UnboundUpload.ts b/apps/server/src/assets/UnboundUpload.ts
 new file mode 100644
-index 0000000000..845f5e1856
+index 0000000000..7ccc104066
 --- /dev/null
 +++ b/apps/server/src/assets/UnboundUpload.ts
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,190 @@
 +// @effect-diagnostics nodeBuiltinImport:off -- copy-on-write clones and exclusive copies are filesystem boundaries missing from Effect's API.
 +/**
 + * Unbound: file attachments of any size.
@@ -97,6 +97,7 @@ index 0000000000..845f5e1856
 +import * as Effect from "effect/Effect";
 +import * as FileSystem from "effect/FileSystem";
 +import * as Path from "effect/Path";
++import * as PlatformError from "effect/PlatformError";
 +import * as Stream from "effect/Stream";
 +import { HttpServerResponse, type HttpServerRequest } from "effect/http";
 +
@@ -120,11 +121,24 @@ index 0000000000..845f5e1856
 + * Claiming an upload for a thread copies it, and the pending original stays for a day. A
 + * copy-on-write clone makes that instant and free on APFS, Btrfs and XFS; elsewhere it is a copy.
 + */
-+export const cloneOrCopyFile = (fromPath: string, toPath: string) =>
++const copyFile = (fromPath: string, toPath: string, mode: number) =>
 +  Effect.tryPromise({
-+    try: () => NodeFSP.copyFile(fromPath, toPath, NodeFSP.constants.COPYFILE_FICLONE),
-+    catch: (cause) => cause,
++    try: () => NodeFSP.copyFile(fromPath, toPath, mode),
++    catch: (cause) =>
++      PlatformError.systemError({
++        _tag:
++          cause instanceof Error && "code" in cause && cause.code === "EEXIST"
++            ? "AlreadyExists"
++            : "Unknown",
++        module: "FileSystem",
++        method: "copyFile",
++        pathOrDescriptor: toPath,
++        cause,
++      }),
 +  });
++
++export const cloneOrCopyFile = (fromPath: string, toPath: string) =>
++  copyFile(fromPath, toPath, NodeFSP.constants.COPYFILE_FICLONE);
 +
 +interface UnboundUploadClaims {
 +  readonly type: "image" | "file";
@@ -206,12 +220,7 @@ index 0000000000..845f5e1856
 +
 +  // Publishing without replacement keeps an upload and its cached text immutable.
 +  yield* fileSystem.link(partPath, finalPath).pipe(
-+    Effect.catch(() =>
-+      Effect.tryPromise({
-+        try: () => NodeFSP.copyFile(partPath, finalPath, NodeFSP.constants.COPYFILE_EXCL),
-+        catch: (cause) => cause,
-+      }),
-+    ),
++    Effect.catch(() => copyFile(partPath, finalPath, NodeFSP.constants.COPYFILE_EXCL)),
 +  );
 +  yield* fileSystem.remove(partPath, { force: true }).pipe(Effect.ignore);
 +  const documents = yield* DocumentText.DocumentText;
